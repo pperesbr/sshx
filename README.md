@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="sshx" width="480">
+  <img src="assets/logo.png" alt="sshx" width="480">
 </p>
 
 # sshx
