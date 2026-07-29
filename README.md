@@ -6,12 +6,56 @@
 
 Go SSH client library for network equipment automation.
 
-Born from a real need: accessing routers and olts in a telecom transport
-and access network environment. The equipment is modern, the ciphers are modern,
-and we don't need legacy compatibility hacks. sshx only supports equipment that
-speaks modern cryptography — no CBC, no DES, no RC4.
+Born from a real need: accessing routers and OLTs in a telecom
+transport and access network.
 
-No regex. No legacy cipher hacks. Pure Go.
+## Why sshx exists
+
+sshx is built around one constraint: **the binary must run anywhere,
+with nothing installed next to it.**
+
+Network automation runs in the least maintained places in the
+infrastructure — jump hosts nobody patches, management servers that
+predate the current team, containers that have to pass a vulnerability
+scan. In those places every runtime dependency is a ticket.
+`CGO_ENABLED=0`, a single static binary, `scp`, done.
+
+That constraint drives every other decision in this library:
+
+- **Pure Go.** No cgo, no shared libraries, no external toolchain.
+  Cross-compiles to any target Go supports. Runs in `FROM scratch`.
+- **Modern ciphers only.** sshx uses Go's `crypto/ssh` as-is. It does
+  not work around equipment that offers only CBC, DES or RC4 — it
+  refuses to connect. See [Supported Equipment](#supported-equipment).
+- **No regex in the hot path.** ANSI filtering and prompt detection
+  happen byte by byte, in a single pass, with zero allocations. See
+  [How It Works](#how-it-works--prompt-detection-in-detail).
+- **Small enough to read.** This is operational tooling. When it breaks
+  at 3am, the person debugging it should be able to hold the whole
+  thing in their head.
+
+The cost is real and worth stating plainly: **sshx will not talk to
+your oldest equipment.** If you need to reach a device that speaks only
+legacy crypto, sshx is the wrong tool and no configuration flag will
+change that. It is a design decision, not a gap.
+
+## When not to use sshx
+
+sshx is deliberately narrow. Use something else if:
+
+- **You need to reach legacy equipment.** Devices offering only CBC,
+  DES or RC4 will be refused.
+- **You need NETCONF, gNMI or telnet.** sshx does SSH against an
+  interactive CLI. That is all it does.
+- **You need broad, tested platform coverage.** The supported list
+  below is what has been verified against real equipment in a
+  transport and access network. Anything outside it is unknown.
+- **You want prompt auto-detection.** sshx requires the exact prompt
+  string, by design — see [Trade-offs](#trade-offs).
+
+Mature, general-purpose alternatives exist and are the right choice for
+most of these cases. sshx solves a narrower problem: modern equipment,
+static binary, no runtime dependencies.
 
 ---
 
@@ -681,3 +725,12 @@ go test -v -count=1 -run TestHuaweiVRP ./...
 ```
 
 Tests skip automatically when `SSHX_HOST` is not set.
+
+## Credits
+
+The byte-level FSM approach to stream parsing was inspired by
+[influxdata/go-syslog](https://github.com/leodido/go-syslog), which
+parses syslog messages with a state machine instead of regular
+expressions. Different problem, same idea: when bytes arrive in chunks
+and you only get to look at each one once, a state machine fits better
+than pattern matching.
