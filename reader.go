@@ -17,9 +17,19 @@ const (
 	stateOSC
 )
 
+const readChunkSize = 4096
+
 // Reader processes bytes from an io.Reader (SSH stdout), strips ANSI
 // escape sequences via a finite state machine, and detects a prompt
 // using a sliding window implemented as a circular buffer.
+//
+// A Reader is meant to live as long as its source: a single goroutine
+// (started on the first WaitForPrompt) reads src and hands chunks over a
+// channel. Bytes are never read by anyone else, so a WaitForPrompt that
+// times out does not lose or steal output from the next one, and bytes
+// that arrive after a prompt are kept for the next call.
+//
+// A Reader is not safe for concurrent use.
 type Reader struct {
 	src    io.Reader
 	prompt []byte
@@ -34,6 +44,16 @@ type Reader struct {
 
 	// Full raw output including ANSI codes
 	raw bytes.Buffer
+
+	// Single reader goroutine and its hand-off.
+	started bool
+	chunks  chan []byte // unbuffered: the pump blocks until a chunk is consumed
+	errc    chan error  // receives the source error once, after the last chunk
+	srcErr  error       // sticky source error (e.g. io.EOF after Close)
+
+	// Bytes already read from src but not consumed yet
+	// (what came after the prompt in the last chunk).
+	pending []byte
 }
 
 // NewReader creates a Reader that reads from src and detects the given prompt.
@@ -115,41 +135,85 @@ func (r *Reader) pushClean(b byte) bool {
 	return true
 }
 
-// WaitForPrompt reads from the source until the prompt is detected or
-// the context is cancelled. Returns the full raw output.
-func (r *Reader) WaitForPrompt(ctx context.Context) (string, error) {
-	done := make(chan struct{})
-	readErr := make(chan error, 1)
+// feed processes a chunk. When the prompt is found, the bytes after it are
+// kept in pending for the next WaitForPrompt and feed returns true.
+func (r *Reader) feed(chunk []byte) bool {
+	for i, b := range chunk {
+		if r.feedByte(b) {
+			if rest := chunk[i+1:]; len(rest) > 0 {
+				r.pending = append(r.pending, rest...)
+			}
+			return true
+		}
+	}
+	return false
+}
 
-	go func() {
-		buf := make([]byte, 4096)
+// start launches the single goroutine that reads src for the lifetime of
+// the Reader. It exits when src returns an error (io.EOF on session close).
+func (r *Reader) start() {
+	r.started = true
+	r.chunks = make(chan []byte)
+	r.errc = make(chan error, 1)
+
+	go func(src io.Reader, chunks chan<- []byte, errc chan<- error) {
 		for {
-			n, err := r.src.Read(buf)
-			for _, b := range buf[:n] {
-				if r.feedByte(b) {
-					close(done)
-					return
-				}
+			buf := make([]byte, readChunkSize)
+			n, err := src.Read(buf)
+			if n > 0 {
+				chunks <- buf[:n]
 			}
 			if err != nil {
-				readErr <- err
+				errc <- err
 				return
 			}
 		}
-	}()
+	}(r.src, r.chunks, r.errc)
+}
 
-	select {
-	case <-done:
-		return r.raw.String(), nil
-	case err := <-readErr:
-		return r.raw.String(), err
-	case <-ctx.Done():
-		return r.raw.String(), fmt.Errorf("waiting for prompt %q: %w", r.prompt, ctx.Err())
+// WaitForPrompt reads until the prompt is detected or the context is
+// cancelled. Returns the raw output accumulated since the last Reset
+// (or since creation), including the prompt.
+//
+// On timeout or cancellation the source keeps being owned by this Reader:
+// nothing is lost, and whatever is still arriving is delivered to the next
+// WaitForPrompt.
+func (r *Reader) WaitForPrompt(ctx context.Context) (string, error) {
+	// Bytes left over from the previous call come first.
+	if len(r.pending) > 0 {
+		p := r.pending
+		r.pending = nil
+		if r.feed(p) {
+			return r.raw.String(), nil
+		}
+	}
+
+	if r.srcErr != nil {
+		return r.raw.String(), r.srcErr
+	}
+	if !r.started {
+		r.start()
+	}
+
+	for {
+		select {
+		case chunk := <-r.chunks:
+			if r.feed(chunk) {
+				return r.raw.String(), nil
+			}
+		case err := <-r.errc:
+			// chunks is unbuffered, so every chunk was consumed before this.
+			r.srcErr = err
+			return r.raw.String(), err
+		case <-ctx.Done():
+			return r.raw.String(), fmt.Errorf("waiting for prompt %q: %w", r.prompt, ctx.Err())
+		}
 	}
 }
 
-// Reset clears the reader state so it can be reused for the next command
-// on the same session.
+// Reset clears the prompt detection state and the accumulated output so
+// the Reader can be reused for the next command on the same session.
+// Bytes already read but not consumed are kept.
 // Panics if prompt is empty.
 func (r *Reader) Reset(prompt string) {
 	if len(prompt) == 0 {

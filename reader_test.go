@@ -240,9 +240,12 @@ func TestContextCancellation(t *testing.T) {
 }
 
 func TestReset(t *testing.T) {
-	// First command with one prompt
+	// One stream, two commands: the second prompt is different
+	// (entered config mode). Both outputs come from the same source,
+	// as they do on a real session.
 	input1 := "output1\r\n<ROUTER-PE01>"
-	r := NewReader(bytes.NewReader([]byte(input1)), "<ROUTER-PE01>")
+	input2 := "config output\r\n[~ROUTER-PE01]"
+	r := NewReader(bytes.NewReader([]byte(input1+input2)), "<ROUTER-PE01>")
 
 	output1, err := r.WaitForPrompt(ctx(t))
 	if err != nil {
@@ -252,9 +255,6 @@ func TestReset(t *testing.T) {
 		t.Fatalf("first command: output mismatch\ngot:  %q\nwant: %q", output1, input1)
 	}
 
-	// Reset with new prompt (entered config mode, prompt changed)
-	input2 := "config output\r\n[~ROUTER-PE01]"
-	r.src = bytes.NewReader([]byte(input2))
 	r.Reset("[~ROUTER-PE01]")
 
 	output2, err := r.WaitForPrompt(ctx(t))
@@ -263,6 +263,91 @@ func TestReset(t *testing.T) {
 	}
 	if output2 != input2 {
 		t.Fatalf("second command: output mismatch\ngot:  %q\nwant: %q", output2, input2)
+	}
+}
+
+func TestResetKeepsBytesAfterPromptAcrossChunks(t *testing.T) {
+	// Bytes that arrive in the same chunk right after the prompt must not
+	// be lost: they belong to the next command.
+	input1 := "a\r\n<PE01>"
+	input2 := "b\r\n<PE01>"
+	r := NewReader(&slowReader{data: []byte(input1 + input2), chunkSize: 7}, "<PE01>")
+
+	out1, err := r.WaitForPrompt(ctx(t))
+	if err != nil || out1 != input1 {
+		t.Fatalf("first: got %q, %v", out1, err)
+	}
+	r.Reset("<PE01>")
+	out2, err := r.WaitForPrompt(ctx(t))
+	if err != nil || out2 != input2 {
+		t.Fatalf("second: got %q, %v", out2, err)
+	}
+}
+
+// pipeSource lets a test write to the Reader source at any time.
+func pipeSource(t *testing.T) (*io.PipeReader, *io.PipeWriter) {
+	t.Helper()
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.Close() })
+	return pr, pw
+}
+
+func TestTimeoutDoesNotLoseOutput(t *testing.T) {
+	// A WaitForPrompt that times out must not leave a goroutine stealing
+	// bytes: output written afterwards reaches the next WaitForPrompt whole.
+	pr, pw := pipeSource(t)
+	r := NewReader(pr, "<PE01>")
+
+	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := r.WaitForPrompt(short); err == nil {
+		t.Fatal("expected timeout")
+	}
+
+	go pw.Write([]byte("late output\r\n<PE01>"))
+
+	r.Reset("<PE01>")
+	out, err := r.WaitForPrompt(ctx(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != "late output\r\n<PE01>" {
+		t.Fatalf("output mismatch: %q", out)
+	}
+}
+
+func TestStopAtCustomPromptThenDrain(t *testing.T) {
+	// Collector pattern: stop at a line inside the output (checkpoint),
+	// then drain until the real prompt. The next command must start clean.
+	stream := "rec 3\r\nrec 2\r\nCHECKPOINT\r\nrec 1\r\nrec 0\r\n<PE01>" +
+		"next command output\r\n<PE01>"
+	r := NewReader(&slowReader{data: []byte(stream), chunkSize: 5}, "CHECKPOINT")
+
+	out, err := r.WaitForPrompt(ctx(t))
+	if err != nil || out != "rec 3\r\nrec 2\r\nCHECKPOINT" {
+		t.Fatalf("checkpoint: got %q, %v", out, err)
+	}
+
+	r.Reset("<PE01>")
+	if _, err := r.WaitForPrompt(ctx(t)); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	r.Reset("<PE01>")
+	out, err = r.WaitForPrompt(ctx(t))
+	if err != nil || out != "next command output\r\n<PE01>" {
+		t.Fatalf("next command: got %q, %v", out, err)
+	}
+}
+
+func TestEOFIsSticky(t *testing.T) {
+	r := NewReader(bytes.NewReader([]byte("no prompt")), "<PE01>")
+	if _, err := r.WaitForPrompt(ctx(t)); err != io.EOF {
+		t.Fatalf("first: expected io.EOF, got %v", err)
+	}
+	r.Reset("<PE01>")
+	if _, err := r.WaitForPrompt(ctx(t)); err != io.EOF {
+		t.Fatalf("second: expected io.EOF, got %v", err)
 	}
 }
 

@@ -11,12 +11,18 @@ import (
 )
 
 // Session represents an interactive SSH shell session with a network device.
+//
+// A Session is not safe for concurrent use: run one command at a time.
 type Session struct {
 	cfg    Config
 	client *ssh.Client
 	sess   *ssh.Session
 	stdin  io.WriteCloser
 	stdout io.Reader
+
+	// reader is the only consumer of stdout for the whole session, so
+	// output is never lost or split between two commands.
+	reader *Reader
 }
 
 // NewSession connects to the device, opens an interactive shell with PTY,
@@ -90,6 +96,7 @@ func NewSession(cfg Config) (*Session, error) {
 		sess:   sess,
 		stdin:  stdin,
 		stdout: stdout,
+		reader: NewReader(stdout, cfg.Prompt),
 	}
 
 	// Consume the login banner by reading until the first prompt.
@@ -131,6 +138,31 @@ func (s *Session) Write(cmd string) error {
 	return nil
 }
 
+// Interrupt sends Ctrl+C (ETX, 0x03) without a newline, to abort the
+// command that is running (e.g. a long "display" once the needed part of
+// the output was read). The rest of the output and the prompt are still
+// on the way: call WaitPrompt before the next Run.
+func (s *Session) Interrupt() error {
+	if err := s.write("\x03"); err != nil {
+		return fmt.Errorf("cmdx: interrupt: %w", err)
+	}
+	return nil
+}
+
+// WaitPrompt reads until the current prompt without sending anything.
+// Use it to drain the session after Interrupt, or after a Run that
+// stopped at a custom prompt set with SetPrompt.
+func (s *Session) WaitPrompt(ctx context.Context) (string, error) {
+	ctx, cancel := s.withCommandTimeout(ctx)
+	defer cancel()
+
+	output, err := s.readUntilPrompt(ctx)
+	if err != nil {
+		return output, fmt.Errorf("cmdx: wait prompt: %w", err)
+	}
+	return output, nil
+}
+
 // SetPrompt changes the expected prompt for subsequent commands.
 // Useful when the device changes prompt between contexts
 // (e.g. Nokia 7360: "HOST>#" → "HOST>environment#").
@@ -156,10 +188,10 @@ func (s *Session) write(data string) error {
 	return err
 }
 
-// readUntilPrompt creates a Reader and waits for the prompt.
+// readUntilPrompt waits for the current prompt using the session's Reader.
 func (s *Session) readUntilPrompt(ctx context.Context) (string, error) {
-	r := NewReader(s.stdout, s.cfg.Prompt)
-	return r.WaitForPrompt(ctx)
+	s.reader.Reset(s.cfg.Prompt)
+	return s.reader.WaitForPrompt(ctx)
 }
 
 // withCommandTimeout returns a context with the command timeout applied,
