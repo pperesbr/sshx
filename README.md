@@ -203,8 +203,33 @@ sess, err := sshx.NewSession(cfg)    // Connect, consume login banner
 output, err := sess.Run(ctx, cmd)    // Send command, wait for prompt
 err := sess.Write(cmd)               // Send command, don't wait
 sess.SetPrompt(newPrompt)            // Change expected prompt
+err := sess.Interrupt()              // Send Ctrl+C (0x03), no newline
+output, err := sess.WaitPrompt(ctx)  // Read until prompt, send nothing
 sess.Close()                         // Close session and connection
 ```
+
+A Session is not safe for concurrent use: run one command at a time.
+
+### Stopping a long command early
+
+`SetPrompt` accepts any text, so a command can stop at a line inside its
+own output — for example, the first record already collected. Then
+interrupt the device and drain until the real prompt before the next
+command:
+
+```go
+sess.SetPrompt("User offline time  : 2026-11-11 13:09:42")
+output, err := sess.Run(ctx, "display aaa offline-record domain-name hsi | no-more")
+sess.SetPrompt("<huawei-router>")
+
+sess.Interrupt()        // abort the display on the device
+sess.WaitPrompt(ctx)    // drain what is still in flight
+```
+
+The session keeps a single goroutine reading the device output for its
+whole lifetime. A command that times out does not lose or steal bytes
+from the next one, and output that arrives after a prompt is kept for
+the next call.
 
 ---
 
